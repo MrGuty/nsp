@@ -4,6 +4,7 @@ import logging
 import numpy as np
 import sqlite3
 from io import StringIO
+from pathlib import Path
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,71 @@ def get_historic_p(db_location,citation_date_column,grouping_columns,nsp_column,
     del history["citations_cumcount"]
     del history["nsp_cumsum"]
     return history
+
+######################
+##########NUEVO########
+#######################
+def harversine_distance(lat1, lon1, lat2, lon2):
+    r = 6371
+    phi_1 = np.radians(lat1)
+    phi_2 = np.radians(lat2)
+    d_phi = np.radians(lat2-lat1)/2
+    d_l = np.radians(lon2 - lon1)/2
+    
+    term1 = np.sin(d_phi)**2 + np.cos(phi_1)*np.cos(phi_2)*(np.sin(d_l)**2)
+    term2 = r*(2*np.arctan2(np.sqrt(term1), np.sqrt(1-term1)))
+    
+    return np.round(term2, 8)
+
+def asigna_comunas(comunas, comuna_est_location = 'data/raw/hrt/estaciones_comunas_maule.csv', 
+                    comuna_region_location = 'data/processed/meteorological/hrt/comunas_maule.csv',
+                    save_result = True,
+                    output_location = 'data/processed/meteorological/hrt/comuna_asignada.csv' ):
+  comuna_est = pd.read_csv(comuna_est_location)
+  comuna_region = pd.read_csv(comuna_region_location)
+  comuna_asignada = []
+  for i in range(comunas.shape[0]):
+    com = comunas.iloc[i][0]
+    comuna_aux = comuna_region[comuna_region['name'] == com]
+    if (com not in list(comuna_region.name)) or (comuna_aux.shape[0] == 0):
+      comuna_asignada.append("pencahue")
+    elif com in comuna_est:
+      comuna_asignada.append(com) 
+    else:
+      lat1 = float(comuna_aux.lat.values[0])
+      lon1 = float(comuna_aux.lng.values[0])
+      comuna_region_aux = comuna_region.copy()
+      comuna_region_aux['distancia'] = harversine_distance(lat1, lon1, comuna_region_aux.lat , comuna_region_aux.lon)
+      comuna_region_aux = comuna_region_aux.sort_values(by = 'distancia', ascending=True, inplace=False, na_position='last')
+      for com2 in comuna_region_aux["name"].values:
+        if com2 in comuna_est:
+          comuna_asignada.append(com2)
+
+    if save_result:
+        df_aux = pd.DataFrame(comuna_asignada)
+        df_aux.to_csv(output_location, index = False)
+
+  return comuna_asignada
+
+
+def merge_features(data, col_comuna = "comuna_asignada", dfs_dic):
+    df_aux_dic = {}
+    data = data.drop_duplicates()
+    for comuna in list(set(data[col_comuna].values)):
+        #print(comuna)
+        features_comuna = dfs_dic[comuna]
+        condition = (data[col_comuna] == comuna)
+        df_comuna = data.loc[condition].copy()
+        df_aux_dic[comuna] = df_comuna.merge( features_comuna,how = "left", 
+                                     left_on = ["month_number", "month", "day_number", "day", "hour", "year"],  
+                                     right_on =["month_number", "month", "day_number", "day", "hour", "year"] )
+        aux_comuna = comuna
+        df_final = pd.DataFrame(columns = df_aux_dic[aux_comuna].columns)
+    for df in df_aux_dic.values():
+        df_final = df_final.append(df, ignore_index = True)
+    df_final.reset_index(drop = True, inplace = True)
+    return df_final
+
 class Featurizer:
     def __init__(self,interim_dataset_location):
         self.data = pd.read_csv(interim_dataset_location)
@@ -168,10 +234,31 @@ class FeaturizerCrsco:
 
 
 class FeaturizerHrt:
-    def __init__(self,interim_dataset_location):
+    def __init__(self,interim_dataset_location, 
+                add_comuna = False, comuna_location = 'data/processed/meteorological/hrt/comuna_asignada.csv',
+                add_comunas_dic = False,
+                comunas_location = 'data/processed/meteorological/hrt/comunas_features/'):
         self.data = pd.read_csv(interim_dataset_location)
+        if add_comuna:
+            comuna_asignada = pd.read_csv(comuna_location)
+            self.data["comuna_asignada"] = comuna_asignada
+        if add_comunas_dic:
+            txt_folder = Path('Dataset/hrt/comunas_stations_features').rglob('*.csv')
+            files = [x for x in txt_folder]
+            dfs = [pd.read_csv(csv_file) for csv_file in files]
+            txt_folder = Path(comuna_dic_location).rglob('*.csv')
+            files = [x for x in txt_folder]
+            dfs = [make_features(pd.read_csv(csv_file)) for csv_file in files]
+            file_names = []
+            for file_name in files:
+                file_aux = r'%s' % file_name
+                file_aux = re.sub(r'.*\\', '', file_aux)
+                file_aux = file_aux.replace(".csv", "")
+                file_names.append(file_aux)
+            comunas_dic = {file_name:df for (file_name, df) in list(zip(file_names, dfs))}
+            self.comunas_dic = comunas_dic
         logger.info("current shape: {}".format(self.data.shape))
-    def generate_basic_features(self,idx="RUT",db_location="data/processed/hrt_history.sqlite"):
+    def generate_basic_features(self,idx="RUT",db_location="data/processed/hrt_history.sqlite", meteoro = False):
         self.data["FECHA_CITA"] = pd.to_datetime(self.data["FECHA_CITA"])
         self.data.sort_values(by="FECHA_CITA",ascending=True,inplace=True)
         self.data["HORA_CITA"] = pd.to_datetime(self.data["HORA_CITA"])
@@ -197,6 +284,28 @@ class FeaturizerHrt:
         self.data = self.data[(self.data["hour"] <= 17) & (self.data["hour"] >= 8)]
         self.data = self.data[(self.data["delay"] <= 10) & (self.data["delay"] >= 0)]
         self.data["delay"] = self.data["delay"].astype('category')
+
+        ######NUEVO##########
+        #Necesario para merge con las nuevas features
+        if meteoro:
+            self.data["month_number"] = self.data["FECHA_CITA"].dt.month
+            self.data["day_number"] = self.data["FECHA_CITA"].dt.day
+            self.data["year"] = self.data["FECHA_CITA"].dt.year
+            self.data = merge_features(self.data, dfs_dic = self.comunas_dic)
+            self.data.drop(inplace = True, columns = ["comuna_asignada", "year", "day_number", "month_number"])
+            self.data[ 'LLuvia_binaria'] = pd.to_numeric(self.data[ 'LLuvia_binaria'])
+            self.data["Temperatura"] = discretize(self.data.loc[:,["Temperatura"]], bins = 7, strategy='uniform')
+            self.data["Temperatura_min"] = discretize(self.data.loc[:,["Temperatura_min"]], bins = 8, strategy='uniform')
+            self.data["Temperatura_max"] = discretize(self.data.loc[:,["Temperatura_max"]], bins = 7, strategy='uniform')
+            self.data["Humedad"] = discretize(self.data.loc[:,["Humedad"]], bins = 7, strategy='kmeans')
+            self.data["Radiacion_solar"] = discretize(self.data.loc[:,["Radiacion_solar"]], bins = 38, strategy='kmeans')
+        
+            feature_columns = ["Temperatura", 'Humedad','Temperatura_min', 'Temperatura_max', 'Radiacion_solar']
+
+            for feature in feature_columns:
+                self.data[feature] = self.data[feature].astype('category')
+        #####################
+
         self.data["hour"] = self.data["hour"].astype('category')
         logger.info("current shape: {}".format(self.data.shape))
 
